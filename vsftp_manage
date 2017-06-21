@@ -1,0 +1,524 @@
+#!/bin/bash
+# Author:	zrlyou
+# Date: 	2017/05/24
+# FileName: vsftp_ftp.sh
+# Function: Manage vsftp
+
+# port info
+LISTEN_PORT=60521
+PASV_MIN_PORT=35000
+PASV_MAX_PORT=45000
+
+# config
+CONFS=(anonymous_enable=NO
+local_enable=YES
+write_enable=YES
+local_umask=022
+dirmessage_enable=YES
+xferlog_enable=YES
+connect_from_port_20=YES
+xferlog_file=/var/log/xferlog
+xferlog_std_format=YES
+ascii_upload_enable=YES
+ascii_download_enable=YES
+listen=YES
+pam_service_name=vsftpd.vu
+userlist_enable=YES
+tcp_wrappers=YES
+guest_enable=YES
+guest_username=ftp
+user_config_dir=/etc/vsftpd/vuser_conf
+listen_port=${LISTEN_PORT}
+pasv_min_port=${PASV_MIN_PORT}
+pasv_max_port=${PASV_MAX_PORT}
+pasv_enable=YES
+pasv_promiscuous=YES
+use_localtime=YES
+vsftpd_log_file=/var/log/vsftpd.log
+dual_log_enable=YES)
+
+# user config
+USER_CONFS=(local_root=/data/ftp/username
+write_enable=YES
+anon_umask=022
+anon_world_readable_only=NO
+anon_upload_enable=YES
+anon_mkdir_write_enable=YES
+anon_other_write_enable=YES)
+
+# service name
+SERVICE_NAME="vsftpd"
+FTP_ROOT_PATH="/data/ftp"
+CONF_PATH="/etc/vsftpd/vsftpd.conf"
+USER_FILE="/etc/vsftpd/vuser.txt"
+USER_DB_FILE="/etc/vsftpd/vuser.db"
+AUTH_FILE="/etc/pam.d/vsftpd.vu"
+USER_CONFIG_PATH="/etc/vsftpd/vuser_conf"
+
+# env ensure
+function env_ensure()
+{
+	local selinux_config="/etc/selinux/config"
+	local get_selinuc_config="`grep -e "^SELINUX=" "${selinux_config}" |awk -F "=" '{print $2}'`"
+	
+	if [ "${get_selinuc_config}" != "disabled" ]; then
+		echo "The Selinux config is ${get_selinuc_config}, please set it 'SELINUX=disabled'"
+		exit 1
+	fi
+
+	local is_installed=`rpm -qa | grep vsftpd | wc -l`
+	if [ ${is_installed} -ne 0 ]; then
+		echo "The vsftpd was installed!Don't need to install!"
+		exit 1
+	fi
+}
+
+# set the config file for vsftpd
+function set_config_for_vsftpd()
+{
+	if [ -e "${CONF_PATH}" ]; then
+		local backup_file="${CONF_PATH}_bak"
+		echo "Backup the old config file, backup filename:${backup_file}"
+		mv "${CONF_PATH}" "${backup_file}"
+		if [ $? -eq 0 ]; then
+			echo "Backup is done!"
+			echo "Will be set the config to new config file..."
+			for conf in ${CONFS[@]}
+			do
+				echo "Set '${conf}' to ${CONF_PATH}"
+				echo "${conf}" >> "${CONF_PATH}"
+			done
+			echo "Set a new config file is done!"
+		fi
+	fi
+}
+
+# get system ftp username
+function get_system_ftp_username()
+{
+	local system_username="`cat /etc/passwd | grep -e "^[Ff]tp" | awk -F ':' '{print $1}'`"
+	echo -n "${system_username}"
+}
+
+# check the "ftp" user of system user,if it not exist,will be create it
+function check_ftp_user()
+{
+	local ftp_count=`cat /etc/passwd | grep -e "^[Ff]tp" | wc -l`
+	if [ ${ftp_count} -eq 0 ]; then
+		echo "The ftp user is not exist,will be add it!"
+		useradd -d "${FTP_ROOT_PATH}" -s /sbin/nologin ftp
+		if [ $? -eq 0 ]; then
+			echo "Add the 'ftp' user is done!"
+		else
+			echo "Add the 'ftp' user is failed,error code: $?"
+			exit 1
+		fi
+	else
+		local ftp_user="$(get_system_ftp_username)"
+		echo "The '${ftp_user}' user is exist!"
+		if [ ! -d "${FTP_ROOT_PATH}" ]; then
+			mkdir -p "${FTP_ROOT_PATH}"
+		fi
+	
+		/bin/chown "${ftp_user}":"${ftp_user}" -R "${FTP_ROOT_PATH}"
+		if [ $? -eq 0 ]; then
+			echo "Chown ${FTP_ROOT_PATH} to '${ftp_user}' user is done!"
+		fi
+	fi
+}
+
+# set iptables
+function set_iptables()
+{
+	iptables -A INPUT -p tcp --dport "${LISTEN_PORT}" -j ACCEPT
+	iptables -A INPUT -p tcp --dport "${PASV_MIN_PORT}":"${PASV_MAX_PORT}" -j ACCEPT
+	/etc/init.d/iptables save
+}
+
+# install vsftpd
+function install_vsftpd()
+{
+	yum -y install "${SERVICE_NAME}"
+	if [ $? -eq 0 ]; then
+		set_config_for_vsftpd
+		check_ftp_user
+		set_iptables
+	else
+		echo "Yum install vsftpd is failed! Please check your network connection!"
+		exit 1
+	fi
+}
+
+# check ftp virtual user is exist
+function check_virtual_user_exist()
+{
+	local user_name="$1"
+	local user_count="`cat "${USER_FILE}" | grep "${user_name}" | wc -l`"
+	local is_exist=FALSE
+	
+	if [ ${user_count} -ge 1 ]; then
+		is_exist=TRUE
+	fi
+	
+	echo -n "${is_exist}"
+}
+
+# do db_load
+function do_db_load()
+{
+	/usr/bin/db_load -T -t "hash" -f "${USER_FILE}" "${USER_DB_FILE}"
+}
+
+# create auth file
+function create_auth_file()
+{
+	local username="$1"
+	local userpass="$2"
+	
+	if [ "$(check_virtual_user_exist "${username}")" = "TRUE" ];then
+		echo "${username} is exist!Please input an other username"
+		exit 1
+	fi
+
+	echo "${username}" >> "${USER_FILE}"
+	echo "${userpass}" >> "${USER_FILE}"
+
+	do_db_load	
+
+	if [ $? -eq 0 ];then
+		echo "Create the db file[${USER_DB_FILE}] is done!"
+	else
+		echo "Create the db file[${USER_DB_FILE}] is failed!"
+		exit 1
+	fi
+	
+	if [ ! -e "${AUTH_FILE}" ]; then
+		echo "#%PAM-1.0" > "${AUTH_FILE}"
+    	echo "auth            required        pam_userdb.so   db=/etc/vsftpd/vuser" >> "${AUTH_FILE}"
+    	echo "account         required        pam_userdb.so   db=/etc/vsftpd/vuser" >> "${AUTH_FILE}"
+	fi
+}
+
+# create user config file
+function create_user_config_file()
+{
+	local ftp_user="$1"
+	
+	if [ ! -d "${USER_CONFIG_PATH}" ]; then
+		mkdir -p "${USER_CONFIG_PATH}"
+	fi
+	
+	for user_conf in ${USER_CONFS[@]}
+	do
+		if [ "${user_conf}" = "local_root=/data/ftp/username" ]; then
+			echo "${user_conf//username/${ftp_user}}" >> "${USER_CONFIG_PATH}/${ftp_user}"
+		else
+			echo "${user_conf}" >> "${USER_CONFIG_PATH}/${ftp_user}"
+		fi
+		echo "Set user config[${user_conf}] to ${USER_CONFIG_PATH}/${ftp_user}"
+	done
+	
+	local ftp_user_path="${FTP_ROOT_PATH}/${ftp_user}"
+	local system_ftp_user="$(get_system_ftp_username)"
+	if [ ! -d "${ftp_user_path}" ]; then
+		echo "Make the root directory[${ftp_user_path}] for ${ftp_user}."
+		mkdir -p "${ftp_user_path}"
+		/bin/chown "${system_ftp_user}":"${system_ftp_user}" -R "${ftp_user_path}"
+		if [ $? -eq 0 ]; then
+			echo "Make the root directory[${ftp_user_path}] for ${ftp_user} is done!"
+		else
+			echo "Make the root directory[${ftp_user_path}] for ${ftp_user} is failed!"
+			exit 1
+		fi
+	fi
+}
+
+# add virtual ftp user
+function add_virtual_ftp_user()
+{
+	local all_args=($@)
+	local v_username="${all_args[0]}"
+	local v_userpass="${all_args[1]}"
+
+	echo "Add virtual ftp user[${v_username}]..."
+	
+	if [ -z "${v_username}" -o -z "${v_userpass}" ]; then
+		echo "Username: ${v_username} or Password: ${v_userpass} is null!"
+		exit 1
+	fi
+	
+	create_auth_file "${v_username}" "${v_userpass}"
+	create_user_config_file "${v_username}"
+	echo "Add virtual ftp user[${v_username}] is done!"
+
+	reload_vsftpd
+}
+
+# delete virtual ftp user
+function delete_virtual_ftp_user()
+{
+	local user="$1"
+	
+	if [ -z "${user}" ]; then
+		echo "Username is null!!!"
+		exit 1
+	fi
+
+	if [ "$(check_virtual_user_exist "${user}")" = "TRUE" ]; then
+		read -p "Find username: [${user}],delete it will be delete all data for ${FTP_ROOT_PATH}/${user}! Are you continue?(Y/n):" is_delete
+		if [ "${is_delete}" = "Y" -o "${is_delete}" = "y" ]; then
+			local users="`cat "${USER_FILE}"`"
+			for u in ${users}
+			do
+				if [ "${u}" = ${user} ]; then
+					sed -i "/${u}/{ n; d }" "${USER_FILE}"
+					sed -i "/^${u}$/d" "${USER_FILE}"
+					if [ $? -ne 0 ]; then
+						echo "Delete ${user} from ${USER_FILE} is faild!"
+						exit 1
+					else
+						echo "Delete ${user} from ${USER_FILE} is done!"
+					fi
+					
+					if [ -e "${USER_CONFIG_PATH}/${user}" ]; then
+						rm -rf "${USER_CONFIG_PATH}/${user}"
+						echo "Delete user config file[${USER_CONFIG_PATH}/${user}] of ${user} is done!"
+					fi
+					
+					if [ -d "${FTP_ROOT_PATH}/${user}" ]; then
+						rm -rf "${FTP_ROOT_PATH}/${user}"
+						echo "Delete the directory[${FTP_ROOT_PATH}/${user}] of ${user} is done!"
+					fi
+					echo "Delete user[${user}] is done!"
+					
+					if [ -e "${USER_DB_FILE}" ]; then
+						rm -rf "${USER_DB_FILE}"
+					fi
+					do_db_load
+					reload_vsftpd
+				fi
+			done
+		else
+			echo "Please input 'Y' or 'n'"
+		fi
+	else
+		echo "Can't find the username for ${user}"
+		exit 1
+	fi
+}
+
+# check vsftpd is running
+function is_running()
+{
+	local pid="`ps -ef | grep "${SERVICE_NAME}" | grep -v "grep" | awk '{print $2}'`"
+	if [ ! -z "${pid}" ]; then
+		echo -n "${pid}"
+	else
+		echo -n "FALSE"
+	fi
+}
+
+# operate vsftpd
+function operate_vsftpd()
+{
+	local operate="$1"
+	service "${SERVICE_NAME}" "${operate}"
+}
+
+# start vsftpd
+function start_vsftpd()
+{
+	local get_pid="$(is_running)"
+	if [ "${get_pid}" = "FALSE" ]; then
+		operate_vsftpd "start"
+	else
+		echo "${SERVICE_NAME} is runnig,pid: ${get_pid}, don't need start"
+		exit 1
+	fi
+}
+
+# stop vsftpd
+function stop_vsftpd()
+{
+	operate_vsftpd "stop"
+}
+
+# restart vsftpd
+function restart_vsftpd()
+{
+	operate_vsftpd "restart"
+}
+
+# reload vsftpd
+function reload_vsftpd()
+{
+	local get_pid="$(is_running)"
+	if [ "${get_pid}" != "FALSE" ]; then
+		operate_vsftpd "force-reload"
+	else
+		echo "${SERVICE_NAME} is not running!"
+	fi
+}
+
+#status vsftpd
+function status_vsftpd()
+{
+	operate_vsftpd "status"
+}
+
+# set vsftpd onboot
+function set_vsftpd_onboot()
+{
+	chkconfig "${SERVICE_NAME}" on
+	if [ $? -eq 0 ]; then
+		echo "Set vsftpd onboot is done!"
+	else
+		echo "Set vsftpd onboot is failed!"
+		exit 1
+	fi
+}
+
+# unset vsftpd onboot
+function unset_vsftpd_onboot()
+{
+	chkconfig "${SERVICE_NAME}" off
+	if [ $? -eq 0 ]; then
+		echo "Unset vsftpd onboot is done!"
+	else
+		echo "UnSet vsftpd onboot is failed!"
+		exit 1
+	fi
+}
+
+# delete rules
+function delete_rules()
+{
+	local match_str="$1"
+	local rule="`iptables -n -L --line-numbers | grep "${match_str}"`"
+	local rule_number=`iptables -n -L --line-numbers | grep "${match_str}" | awk '{print $1}'`
+	
+	if [ ! -z "${rule_number}" ]; then
+		echo "Delete iptables rule[${rule}]"
+		iptables -D INPUT ${rule_number}
+		if [ $? -eq 0 ]; then
+			echo "Delete iptables rule[${rule}] is done!"
+		else
+			echo "Delete iptables rule[${rule}] is failed!"
+		fi
+	else
+		echo "Can't find any iptables rules for ${SERVICE_NAME}"
+	fi
+}
+
+# delete iptables rules
+function delete_iptable_rules()
+{
+	delete_rules "${LISTEN_PORT}"
+	delete_rules "${PASV_MIN_PORT}:${PASV_MAX_PORT}"
+	
+}
+
+# uninstall vsftpd
+function uninstall_vsftpd()
+{
+	read -p "Do you uninstall ${SERVICE_NAME}?(Y/n): " is_uninstall
+	if [ "${is_uninstall}" = "Y" -o "${is_uninstall}" = "y" ]; then
+		echo "Uninstall ${SERVICE_NAME}..."
+		yum -y remove "${SERVICE_NAME}"
+		if [ $? -eq 0 ]; then
+			echo "Uninstall ${SERVICE_NAME} is done!"
+			rm -rf "/etc/vsftpd"
+			delete_iptable_rules
+		else
+			echo "Uninstall ${SERVICE_NAME} is failed! Error code:$?"
+			exit $?
+		fi
+	else
+		echo "Will be exit!"
+		exit 0
+	fi
+}
+
+
+# show help
+function show_help()
+{
+	echo "Usage: ./vsftp_manage [cmd] [options]"
+	echo "cmd:"
+	echo "install					install vsftpd by yum"
+	echo "uninstall				uninstall vsftpd by yum"
+	echo "add_user				add ftp virtual user"
+	echo "del_user				delete ftp virtual user"
+	echo "start					start vsftpd"
+	echo "stop					stop vsftpd"
+	echo "restart					restart vsftpd"
+	echo "reload					reload vsftpd"
+	echo "status					check vsftpd status"
+	echo "set_onboot				set vsftpd onboot"
+	echo "unset_onboot				unset vsftpd onboot"
+	echo "options:"
+	echo "username password			when cmd is add_user, it must input username and password"
+	echo "username					when cmd is del_user, it must input username"
+	echo "eg: add_user test 123456"
+	echo "Notes:"
+	echo "The default port is 60521"
+}
+
+function main()
+{
+	local args=($@)
+	local cmd="${args[0]}"
+	local cmd_args=${args[@]:1}
+	
+	case "${cmd}" in
+		# install vsftpd
+		install)
+			env_ensure
+			install_vsftpd
+			;;
+		# add ftp virtual user
+		add_user)
+			add_virtual_ftp_user "${cmd_args}"
+			;;
+		del_user)
+			delete_virtual_ftp_user "${cmd_args}"
+			;;
+		# start vsftpd
+		start)
+			start_vsftpd
+			;;
+		# stop vsftpd
+		stop)
+			stop_vsftpd
+			;;
+		# restart vsftpd
+		restart)
+			restart_vsftpd
+			;;
+		# reload vsftpd
+		reload)
+			reload_vsftpd
+			;;
+		# status vsftpd
+		status)
+			status_vsftpd
+			;;
+		# set vsftpd onboot
+		set_onboot)
+			set_vsftpd_onboot
+			;;
+		# unset vsftpd onboot
+		unset_onboot)
+			unset_vsftpd_onboot
+			;;
+		# uninstall vsftpd
+		uninstall)
+			uninstall_vsftpd
+			;;
+		*)
+			show_help
+			;;
+	esac
+}
+
+main "$@"
