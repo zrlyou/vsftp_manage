@@ -1,5 +1,5 @@
 # vsftp_manage
-用于管理vsftpd，包含安装、卸载、添加虚拟用户等，详细请执行./vsftpd_manage查看
+用于管理vsftpd，包含安装、卸载、添加虚拟用户等，详细请执行./vsftpd_manage查看,适用于CentOs6.X系列
 
 Usage: ./vsftp_manage [cmd] [options]  
 cmd:  
